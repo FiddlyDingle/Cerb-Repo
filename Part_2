@@ -1,0 +1,705 @@
+            }
+            
+            async function loadModels() {
+                try {
+                    const response = await fetch('/models');
+                    const data = await response.json();
+                    
+                    const select = document.getElementById('modelSelect');
+                    select.innerHTML = '';
+                    
+                    if (data.models && data.models.length > 0) {
+                        data.models.forEach(model => {
+                            const option = document.createElement('option');
+                            option.value = model.path;
+                            option.textContent = `${model.name} (${model.size_gb}GB)`;
+                            select.appendChild(option);
+                        });
+                    } else {
+                        select.innerHTML = '<option>No models found</option>';
+                    }
+                    
+                } catch (error) {
+                    console.error('Failed to load models:', error);
+                }
+            }
+            
+            // Load models on page load
+            loadModels();
+        </script>
+    </body>
+    </html>
+    """
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    """Chat endpoint"""
+    try:
+        chat_engine = ai_components["chat_engine"]
+        
+        response = await chat_engine.chat(
+            request.message,
+            use_memory=request.use_memory
+        )
+        
+        return ChatResponse(
+            response=response,
+            timestamp=str(asyncio.get_event_loop().time())
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/models")
+async def get_models():
+    """Get available models"""
+    try:
+        model_manager = ai_components["model_manager"]
+        models = model_manager.get_available_models()
+        
+        return {"models": models}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/status")
+async def get_status():
+    """Get system status"""
+    try:
+        model_manager = ai_components["model_manager"]
+        memory_manager = ai_components["memory_manager"]
+        
+        return {
+            "model_info": model_manager.get_model_info(),
+            "memory_stats": memory_manager.get_stats(),
+            "system_info": model_manager.system_info
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def run_web_server(host: str = "127.0.0.1", port: int = 8000):
+    """Run the web server"""
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+if __name__ == "__main__":
+    print("Starting AI Runner Pro Web Interface...")
+    print("Access at: http://localhost:8000")
+    run_web_server()
+"""
+Chat Engine - Core conversation handling with context awareness
+"""
+
+import asyncio
+import logging
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Callable
+
+logger = logging.getLogger(__name__)
+
+class ChatEngine:
+    """Handles chat logic with memory integration"""
+    
+    def __init__(self, config, model_manager, memory_manager, plugin_manager=None):
+        self.config = config
+        self.model_manager = model_manager
+        self.memory_manager = memory_manager
+        self.plugin_manager = plugin_manager
+        self.current_session = f"session_{int(datetime.now().timestamp())}"
+        
+
+    async def chat(
+        self, 
+        user_message: str,
+        stream_callback: Optional[Callable] = None,
+        use_memory: bool = True
+    ) -> str:
+        """Process chat message with memory context"""
+
+        # Search for relevant context if enabled (more selective)
+        context_memories = []
+        if use_memory and self.memory_manager.encoder:
+            all_similar = await self.memory_manager.search_similar(
+                user_message, top_k=5
+            )
+            # Filter to only highly relevant context
+            context_memories = [
+                m for m in all_similar 
+                if m.get("similarity", 0) > 0.7
+            ][:2]  # Max 2 context items
+        
+        # Build prompt with context
+        prompt = self._build_prompt(user_message, context_memories)
+        
+        # Generate response
+        ai_response = await self.model_manager.generate(
+            prompt=prompt,
+            stream_callback=stream_callback
+        )
+        
+        # Store conversation
+        if self.config.get("memory", "auto_save"):
+            await self.memory_manager.store_conversation(
+                user_message=user_message,
+                ai_response=ai_response,
+                session_id=self.current_session,
+                metadata={
+                    "context_used": len(context_memories),
+                    "model": self.model_manager.model_info.get("name", "unknown"),
+                    "plugin_data_used": self.plugin_manager.get_last_result() is not None if self.plugin_manager else False
+                }
+            )
+        
+        # Clear plugin result after use to avoid stale data
+        if self.plugin_manager:
+            self.plugin_manager.clear_last_result()
+        
+        return ai_response
+    
+    def _build_prompt(self, user_message: str, context_memories: List[Dict]) -> str:
+        """Build contextual prompt with plugin awareness"""
+        prompt_parts = []
+        
+        # Dynamic system prompt with plugin capabilities
+        plugins = self.plugin_manager.get_plugin_list() if self.plugin_manager else []
+        capabilities = [f"- {p['name']}: {p.get('description', 'Available')}" for p in plugins if p.get('enabled', True)]
+        
+        system_prompt = "You are Cerberus (nickname Cerb), Fidd's loyal AI companion. You're direct but friendly, with a dry sense of humor. Keep responses concise unless Fidd asks for details."
+        
+        prompt_parts.append(system_prompt)
+        
+        # Add only highly relevant context if available
+        if context_memories:
+            prompt_parts.append("\nRelevant context:")
+            for memory in context_memories[:1]:  # Only 1 most relevant
+                user_part = memory['user_message'][:80]
+                prompt_parts.append(f"Context: {user_part}")
+        
+        # Add minimal recent context (only if no similar context)
+        if not context_memories:
+            recent = self.memory_manager.get_recent_conversations(limit=1)
+            if recent:
+                last_turn = recent[-1]
+                prompt_parts.append(f"\nContext: {last_turn['user'][:60]}...")
+        
+        prompt_parts.append(f"\nHuman: {user_message}")
+        prompt_parts.append("Assistant:")
+        
+        return "\n".join(prompt_parts)
+    
+
+    def _generate_fallback_response(self, user_message: str) -> str:
+        """Generate fallback response when model unavailable"""
+        msg_lower = user_message.lower()
+        
+        if any(word in msg_lower for word in ["hello", "hi", "hey"]):
+            return "Hello! I'm your AI assistant. How can I help you today?"
+        elif any(word in msg_lower for word in ["how are you", "how's it going"]):
+            return "I'm doing well, thank you! Ready to help with whatever you need."
+        elif "weather" in msg_lower:
+            return "I don't have access to current weather data, but you can check your local weather service."
+        else:
+            return "I'm here to help! Could you tell me more about what you're looking for?"
+    
+    async def get_conversation_context(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recent conversation context"""
+        return await self.memory_manager.get_conversation_history(limit)
+    
+    def start_new_session(self):
+        """Start a new conversation session"""
+        self.current_session = f"session_{int(datetime.now().timestamp())}"
+        logger.info(f"Started new session: {self.current_session}")
+"""
+Configuration Manager - Clean settings handling with validation
+"""
+
+import json
+import logging
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Union
+
+logger = logging.getLogger(__name__)
+
+class ConfigValidationError(Exception):
+    """Configuration validation error"""
+    def __init__(self, message: str, field: str = None):
+        self.message = message
+        self.field = field
+        super().__init__(message)
+
+class ConfigManager:
+    """Manages application configuration with validation"""
+    
+    def __init__(self, config_path: str = "config.json"):
+        self.config_path = Path(config_path)
+        self.validation_errors = []
+        self.config = self._load_config()
+        self._validate_config()
+        
+    def _load_config(self) -> Dict[str, Any]:
+        """Load configuration with defaults"""
+        defaults = {
+            "model": {
+                "default_path": "models/",
+                "context_window": 4096,
+                "max_tokens": 4096,
+                "temperature": 0.7,
+                "gpu_layers": "auto",
+                "timeout_seconds": 90
+            },
+            "memory": {
+                "max_conversations": 50,
+                "embedding_model": "all-MiniLM-L6-v2",
+                "similarity_threshold": 0.3,
+                "auto_save": True,
+                "search_result_count": 2,
+                "auto_cleanup_days": 30
+            },
+            "ui": {
+                "theme": "dark",
+                "font_size": 17,
+                "window_width": 1200,
+                "window_height": 800,
+                "auto_scroll": True,
+                "font_family": "Segoe UI",
+                "input_height": 60,
+                "timestamp_format": "HH:MM"
+            },
+            "performance": {
+                "async_processing": True,
+                "cache_embeddings": True,
+                "preload_model": True,
+                "max_memory_mb": 8132,
+                "thread_count": 4,
+                "cache_size_mb": 128
+            }
+        }
+        
+        if self.config_path.exists():
+            try:
+                with open(self.config_path, 'r') as f:
+                    loaded = json.load(f)
+                    # Merge with defaults
+                    for section, values in loaded.items():
+                        if section in defaults:
+                            defaults[section].update(values)
+                        else:
+                            defaults[section] = values
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in config file: {e}")
+                raise ConfigValidationError(f"Invalid JSON syntax in {self.config_path}: {e}")
+            except Exception as e:
+                logger.warning(f"Config load failed, using defaults: {e}")
+        
+        return defaults
+    
+    def _get_validation_schema(self) -> Dict[str, Any]:
+        """Get validation schema for configuration"""
+        return {
+            "model": {
+                "required": ["default_path", "context_window", "max_tokens", "temperature"],
+                "types": {
+                    "default_path": str,
+                    "context_window": int,
+                    "max_tokens": int,
+                    "temperature": (int, float),
+                    "gpu_layers": (str, int),
+                    "timeout_seconds": (int, float)
+                },
+                "ranges": {
+                    "context_window": (128, 131072),
+                    "max_tokens": (10, 131072),
+                    "temperature": (0.0, 2.0),
+                    "timeout_seconds": (5, 600)
+                }
+            },
+            "memory": {
+                "required": ["max_conversations", "similarity_threshold", "auto_save"],
+                "types": {
+                    "max_conversations": int,
+                    "embedding_model": str,
+                    "similarity_threshold": (int, float),
+                    "auto_save": bool,
+                    "search_result_count": int,
+                    "auto_cleanup_days": int
+                },
+                "ranges": {
+                    "max_conversations": (1, 1000),
+                    "similarity_threshold": (0.0, 1.0),
+                    "search_result_count": (1, 20),
+                    "auto_cleanup_days": (1, 365)
+                }
+            },
+            "ui": {
+                "required": ["window_width", "window_height", "font_size"],
+                "types": {
+                    "theme": str,
+                    "font_size": int,
+                    "window_width": int,
+                    "window_height": int,
+                    "auto_scroll": bool,
+                    "font_family": str,
+                    "input_height": int,
+                    "timestamp_format": str
+                },
+                "ranges": {
+                    "font_size": (8, 48),
+                    "window_width": (800, 3840),
+                    "window_height": (600, 2160),
+                    "input_height": (30, 300)
+                },
+                "choices": {
+                    "theme": ["light", "dark"],
+                    "timestamp_format": ["HH:MM", "HH:MM:SS", "MM:SS", "None"]
+                }
+            },
+            "performance": {
+                "types": {
+                    "async_processing": bool,
+                    "cache_embeddings": bool,
+                    "preload_model": bool,
+                    "max_memory_mb": int,
+                    "thread_count": int,
+                    "cache_size_mb": int
+                },
+                "ranges": {
+                    "max_memory_mb": (512, 65536),
+                    "thread_count": (1, 32),
+                    "cache_size_mb": (32, 2048)
+                }
+            }
+        }
+    
+    def _validate_config(self):
+        """Validate configuration against schema"""
+        schema = self._get_validation_schema()
+        self.validation_errors = []
+        
+        for section_name, section_schema in schema.items():
+            if section_name not in self.config:
+                self.validation_errors.append(f"Missing required section: {section_name}")
+                continue
+                
+            section_config = self.config[section_name]
+            
+            # Check required fields
+            for required_field in section_schema.get("required", []):
+                if required_field not in section_config:
+                    self.validation_errors.append(
+                        f"Missing required field: {section_name}.{required_field}"
+                    )
+            
+            # Validate field types and ranges
+            for field_name, field_value in section_config.items():
+                field_path = f"{section_name}.{field_name}"
+                
+                # Type validation
+                if field_name in section_schema.get("types", {}):
+                    expected_type = section_schema["types"][field_name]
+                    if not self._validate_type(field_value, expected_type):
+                        type_name = self._get_type_name(expected_type)
+                        self.validation_errors.append(
+                            f"Invalid type for {field_path}: expected {type_name}, got {type(field_value).__name__}"
+                        )
+                        continue
+                
+                # Range validation
+                if field_name in section_schema.get("ranges", {}):
+                    min_val, max_val = section_schema["ranges"][field_name]
+                    if not (min_val <= field_value <= max_val):
+                        self.validation_errors.append(
+                            f"Value out of range for {field_path}: {field_value} not in [{min_val}, {max_val}]"
+                        )
+                
+                # Choice validation
+                if field_name in section_schema.get("choices", {}):
+                    valid_choices = section_schema["choices"][field_name]
+                    if field_value not in valid_choices:
+                        self.validation_errors.append(
+                            f"Invalid choice for {field_path}: {field_value} not in {valid_choices}"
+                        )
+        
+        # Path validation
+        self._validate_paths()
+        
+        if self.validation_errors:
+            logger.warning(f"Configuration validation found {len(self.validation_errors)} issues:")
+            for error in self.validation_errors:
+                logger.warning(f"  - {error}")
+    
+    def _validate_type(self, value: Any, expected_type: Union[type, tuple]) -> bool:
+        """Validate value type"""
+        if isinstance(expected_type, tuple):
+            return isinstance(value, expected_type)
+        return isinstance(value, expected_type)
+    
+    def _get_type_name(self, type_spec: Union[type, tuple]) -> str:
+        """Get human-readable type name"""
+        if isinstance(type_spec, tuple):
+            return " or ".join(t.__name__ for t in type_spec)
+        return type_spec.__name__
+    
+    def _validate_paths(self):
+        """Validate path configurations"""
+        model_path = Path(self.config["model"]["default_path"])
+        if not model_path.exists():
+            self.validation_errors.append(
+                f"Model path does not exist: {model_path}. Create this directory or update config."
+            )
+        
+        # Validate font family if specified
+        if "font_family" in self.config.get("ui", {}):
+            font_family = self.config["ui"]["font_family"]
+            if not isinstance(font_family, str) or len(font_family.strip()) == 0:
+                self.validation_errors.append("Invalid font_family: must be non-empty string")
+    
+    def get_validation_errors(self) -> List[str]:
+        """Get list of validation errors"""
+        return self.validation_errors.copy()
+    
+    def is_valid(self) -> bool:
+        """Check if configuration is valid"""
+        return len(self.validation_errors) == 0
+    
+    def get_validation_summary(self) -> str:
+        """Get human-readable validation summary"""
+        if self.is_valid():
+            return "✅ Configuration is valid."
+        
+        summary = f"❌ Configuration has {len(self.validation_errors)} issues:\n\n"
+        for i, error in enumerate(self.validation_errors, 1):
+            summary += f"{i}. {error}\n"
+        
+        summary += "\n🔧 Recommendations:\n"
+        summary += "• Check config.json syntax and field names\n"
+        summary += "• Ensure all required directories exist\n"
+        summary += "• Verify numeric values are within valid ranges\n"
+        summary += "• Use 'reset_to_defaults()' to restore working configuration\n"
+        
+        return summary
+    
+    def save(self):
+        """Save current configuration with backup"""
+        try:
+            # Create backup if file exists
+            if self.config_path.exists():
+                backup_path = self.config_path.with_suffix('.json.backup')
+                backup_path.write_text(self.config_path.read_text())
+            
+            with open(self.config_path, 'w') as f:
+                json.dump(self.config, f, indent=2)
+        except Exception as e:
+            logger.error(f"Config save failed: {e}")
+            raise ConfigValidationError(f"Failed to save configuration: {e}")
+    
+    def get(self, section: str, key: str = None, default=None):
+        """Get configuration value"""
+        if key is None:
+            return self.config.get(section, default)
+        return self.config.get(section, {}).get(key, default)
+    
+    def set(self, section: str, key: str, value: Any):
+        """Set configuration value with validation"""
+        if section not in self.config:
+            self.config[section] = {}
+        
+        # Store old value for rollback
+        old_value = self.config[section].get(key)
+        self.config[section][key] = value
+        
+        # Validate the change
+        old_errors = self.validation_errors.copy()
+        self._validate_config()
+        
+        if not self.is_valid() and old_errors != self.validation_errors:
+            # Rollback on validation failure
+            if old_value is not None:
+                self.config[section][key] = old_value
+            else:
+                del self.config[section][key]
+            self.validation_errors = old_errors
+            raise ConfigValidationError(f"Invalid value for {section}.{key}: {value}")
+        
+        self.save()
+    
+    def get_model_config(self) -> Dict[str, Any]:
+        """Get model configuration"""
+        return self.config["model"]
+    
+    def get_memory_config(self) -> Dict[str, Any]:
+        """Get memory configuration"""
+        return self.config["memory"]
+    
+    def get_ui_config(self) -> Dict[str, Any]:
+        """Get UI configuration"""
+        return self.config["ui"]
+    
+    def reset_to_defaults(self):
+        """Reset configuration to defaults"""
+        backup_path = self.config_path.with_suffix('.json.old')
+        if self.config_path.exists():
+            self.config_path.rename(backup_path)
+            logger.info(f"Old config backed up to {backup_path}")
+        
+        self.config = self._load_config()
+        self._validate_config()
+        self.save()
+        logger.info("Configuration reset to defaults")
+    
+    def validate_and_fix(self) -> bool:
+        """Attempt to automatically fix common validation issues"""
+        if self.is_valid():
+            return True
+        
+        fixed_any = False
+        
+        # Create missing model directory
+        model_path = Path(self.config["model"]["default_path"])
+        if not model_path.exists():
+            try:
+                model_path.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Created missing model directory: {model_path}")
+                fixed_any = True
+            except Exception as e:
+                logger.error(f"Could not create model directory: {e}")
+        
+        # Fix out-of-range values
+        schema = self._get_validation_schema()
+        for section_name, section_schema in schema.items():
+            if section_name in self.config:
+                section_config = self.config[section_name]
+                ranges = section_schema.get("ranges", {})
+                
+                for field_name, (min_val, max_val) in ranges.items():
+                    if field_name in section_config:
+                        value = section_config[field_name]
+                        if value < min_val:
+                            section_config[field_name] = min_val
+                            fixed_any = True
+                            logger.info(f"Fixed {section_name}.{field_name}: {value} -> {min_val}")
+                        elif value > max_val:
+                            section_config[field_name] = max_val
+                            fixed_any = True
+                            logger.info(f"Fixed {section_name}.{field_name}: {value} -> {max_val}")
+        
+        if fixed_any:
+            self._validate_config()
+            self.save()
+        
+        return self.is_valid()
+    
+    def export_schema(self) -> Dict[str, Any]:
+        """Export validation schema for documentation"""
+        return self._get_validation_schema()
+"""
+Error Message Enhancements for AI Runner Pro
+Provides user-friendly error messages and troubleshooting guidance
+"""
+
+import logging
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
+
+class ErrorMessageHelper:
+    """Provides enhanced error messages and troubleshooting guidance"""
+    
+    @staticmethod
+    def get_dependency_error_message(missing_package: str) -> str:
+        """Get user-friendly message for missing dependencies"""
+        messages = {
+            "llama-cpp-python": """
+❌ Missing LLM Engine
+The llama-cpp-python package is required but not installed.
+
+🔧 How to fix:
+1. Run: pip install llama-cpp-python
+2. For GPU support: pip install llama-cpp-python[cuda]
+3. Restart the application
+
+📖 More info: https://github.com/abetlen/llama-cpp-python
+            """,
+            "sentence-transformers": """
+❌ Missing Embedding Engine
+The sentence-transformers package is required for memory functionality.
+
+🔧 How to fix:
+1. Run: pip install sentence-transformers
+2. Restart the application
+
+📖 More info: https://huggingface.co/sentence-transformers
+            """,
+            "dearpygui": """
+❌ Missing UI Framework
+The dearpygui package is required for the user interface.
+
+🔧 How to fix:
+1. Run: pip install dearpygui
+2. Restart the application
+
+📖 More info: https://dearpygui.readthedocs.io/
+            """,
+            "faiss-cpu": """
+❌ Missing Vector Search Engine
+The faiss-cpu package is required for efficient memory search.
+
+🔧 How to fix:
+1. Run: pip install faiss-cpu
+2. For GPU: pip install faiss-gpu (if you have CUDA)
+3. Restart the application
+
+📖 More info: https://github.com/facebookresearch/faiss
+            """
+        }
+        
+        return messages.get(missing_package, f"""
+❌ Missing Package: {missing_package}
+This package is required for the application to function.
+
+🔧 How to fix:
+1. Run: pip install {missing_package}
+2. Restart the application
+        """)
+    
+    @staticmethod
+    def get_model_error_message(error_type: str, details: str = "") -> str:
+        """Get user-friendly message for model-related errors"""
+        messages = {
+            "no_models": """
+❌ No Models Found
+No GGUF model files were found in the models/ directory.
+
+🔧 How to fix:
+1. Download a GGUF model file (e.g., from Hugging Face)
+2. Place it in the models/ directory
+3. Restart the application or use 'Load Model' button
+
+📖 Recommended models:
+• TinyLlama-1.1B (lightweight, good for testing)
+• Llama-2-7B-Chat (balanced performance)
+• Mistral-7B-Instruct (excellent quality)
+
+💡 Download from: https://huggingface.co/models?library=gguf
+            """,
+            "load_failed": f"""
+❌ Model Loading Failed
+Could not load the selected model file.
+
+🔧 Possible causes and fixes:
+• File corrupted: Re-download the model
+• Insufficient memory: Try a smaller model
+• Invalid GGUF format: Ensure file is valid GGUF
+
+Details: {details}
+            """,
+            "path_not_found": f"""
+❌ Model File Not Found
+The specified model file could not be located.
+
+🔧 How to fix:
+1. Verify the file exists in the models/ directory
+2. Check the file name for typos
+3. Ensure proper file permissions
+
+Path: {details}

@@ -1,0 +1,705 @@
+                min_value=0.0,
+                max_value=2.0,
+                callback=self._update_temperature,
+                width=-120
+            )
+            
+            dpg.add_slider_int(
+                label="Max Tokens",
+                tag="max_tokens_slider",
+                default_value=self.config.get("model", "max_tokens"),
+                min_value=50,
+                max_value=32768,
+                callback=self._update_max_tokens,
+                width=-80
+            )
+            
+            dpg.add_slider_int(
+                label="Timeout (seconds)",
+                tag="timeout_slider",
+                default_value=self.config.get("model", "timeout_seconds"),
+                min_value=10,
+                max_value=300,
+                callback=self._update_timeout,
+                width=-80
+            )
+            
+            dpg.add_spacing(count=1)
+            
+            # UI settings
+            dpg.add_text("Interface Settings:", color=self.theme["accent"])
+            dpg.add_slider_int(
+                label="Font Size",
+                tag="font_size_slider",
+                default_value=self.config.get("ui", "font_size"),
+                min_value=10,
+                max_value=24,
+                callback=self._update_font_size,
+                width=-80
+            )
+            
+            dpg.add_slider_int(
+                label="Input Height",
+                tag="input_height_slider",
+                default_value=self.config.get("ui", "input_height"),
+                min_value=60,
+                max_value=200,
+                callback=self._update_input_height,
+                width=-80
+            )
+            
+            dpg.add_slider_float(
+                label="Scroll Speed",
+                tag="scroll_speed_slider",
+                default_value=self.config.get("ui", "auto_scroll_speed"),
+                min_value=0.5,
+                max_value=3.0,
+                callback=self._update_scroll_speed,
+                width=-80
+            )
+            
+            dpg.add_combo(
+                ["HH:MM", "HH:MM:SS", "MM:SS", "None"],
+                label="Timestamp Format",
+                tag="timestamp_combo",
+                default_value=self.config.get("ui", "timestamp_format"),
+                callback=self._update_timestamp_format,
+                width=-80
+            )
+            
+            dpg.add_spacing(count=1)
+            
+            # Memory settings
+            dpg.add_text("Memory Settings:", color=self.theme["accent"])
+            dpg.add_slider_int(
+                label="Search Results",
+                tag="search_results_slider",
+                default_value=self.config.get("memory", "search_result_count"),
+                min_value=1,
+                max_value=10,
+                callback=self._update_search_results,
+                width=-80
+            )
+            
+            dpg.add_slider_int(
+                label="Auto-cleanup (days)",
+                tag="cleanup_days_slider",
+                default_value=self.config.get("memory", "auto_cleanup_days"),
+                min_value=7,
+                max_value=365,
+                callback=self._update_cleanup_days,
+                width=-80
+            )
+        
+        # Plugins
+        with dpg.collapsing_header(label="Plugins", default_open=True):
+            self._create_plugin_controls()
+        
+        # System info
+        with dpg.collapsing_header(label="System Info", default_open=False):
+            dpg.add_text("Loading...", tag="system_info")
+            self._update_system_info()
+    
+    def _create_plugin_controls(self):
+        """Create plugin control buttons"""
+        plugins = self.plugin_manager.get_plugin_list()
+        
+        for plugin in plugins:
+            plugin_name = plugin['name']
+            
+            def make_callback(name):
+                return lambda: self._execute_plugin(name)
+            
+            dpg.add_button(
+                label=f"{plugin_name.title()}",
+                callback=make_callback(plugin_name),
+                width=-1
+            )
+    
+    def _on_input_submit(self, sender, app_data, user_data):
+        """Handle enter key in input - send message"""
+        self._send_message()
+    
+    def _send_message(self):
+        """Send user message"""
+        user_input = dpg.get_value("user_input").strip()
+        if not user_input:
+            return
+        
+        # Clear input
+        dpg.set_value("user_input", "")
+        
+        # Add user message to chat
+        self._add_chat_message("You", user_input, self.theme["accent"])
+        
+        # Disable send button
+        dpg.configure_item("send_btn", label="Generating...", enabled=False)
+        
+        # Queue for thread-safe UI updates
+        import queue
+        ui_queue = queue.Queue()
+        
+        # Start response generation in background
+        def generate_response():
+            try:
+                # Check if model is available
+                if not self.model_manager.model:
+                    ui_queue.put(("error", "Please load a model first using the 'Load Model' button."))
+                    return
+                
+                # Add placeholder for streaming response
+                ui_queue.put(("start_stream", ""))
+                
+                # Stream callback for real-time updates
+                def stream_callback(partial_response):
+                    ui_queue.put(("stream", partial_response))
+                
+                # Run async chat in thread with streaming
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    use_memory = dpg.get_value("use_memory_checkbox")
+                    
+                    response = loop.run_until_complete(
+                        self.chat_engine.chat(
+                            user_input,
+                            stream_callback=stream_callback,
+                            use_memory=use_memory
+                        )
+                    )
+                finally:
+                    loop.close()
+                
+                ui_queue.put(("success", response))
+                
+            except Exception as e:
+                logger.error(f"Chat error: {e}")
+                ui_queue.put(("error", f"Error: {str(e)}"))
+        
+        # Process UI updates on main thread with continuous polling
+        def check_queue():
+            processed_any = False
+            try:
+                while True:  # Process all available messages
+                    msg_type, content = ui_queue.get_nowait()
+                    processed_any = True
+                    
+                    if msg_type == "start_stream":
+                        # Add assistant placeholder for streaming with unique tag
+                        stream_tag = f"streaming_message_{int(time.time() * 1000)}"
+                        self.current_stream_tag = stream_tag
+                        self._add_chat_message("Assistant", "...", self.theme["success"], streaming=True, stream_tag=stream_tag)
+                    elif msg_type == "stream":
+                        # Update streaming message
+                        self._update_streaming_response(content)
+                    elif msg_type == "error":
+                        self._add_chat_message("Assistant", content, self.theme["error"])
+                    else:
+                        # Final response - finalize streaming
+                        self._finalize_streaming_response(content)
+                    
+                    # Re-enable send button only on completion
+                    if msg_type in ["error", "success"]:
+                        dpg.configure_item("send_btn", label="Send Message", enabled=True)
+                        return  # Stop polling on completion
+                        
+            except queue.Empty:
+                # Continue polling if no completion yet
+                if not processed_any or not hasattr(self, 'current_stream_tag'):
+                    threading.Timer(0.05, check_queue).start()  # 20fps for normal polling
+                else:
+                    threading.Timer(0.02, check_queue).start()  # 50fps during active streaming
+        
+        # Start background generation
+        threading.Thread(target=generate_response, daemon=True).start()
+        
+        # Start checking for UI updates with modest delay
+        threading.Timer(0.05, check_queue).start()
+    
+    def _add_chat_message(self, role: str, message: str, color: list, streaming: bool = False, stream_tag: str = None):
+        """Add message to chat history"""
+        timestamp = time.strftime("%H:%M")
+        
+        with dpg.group(parent="chat_history", horizontal=False) as message_group:
+            # Message header
+            with dpg.group(horizontal=True):
+                dpg.add_text(f"{role}:", color=color)
+                dpg.add_text(f"({timestamp})", color=self.theme["text_secondary"])
+            
+            # Message content
+            if streaming and stream_tag:
+                dpg.add_text(message, tag=stream_tag, wrap=750)
+                # Store the group ID for later cleanup
+                self.streaming_group_id = message_group
+            else:
+                dpg.add_text(message, wrap=750)
+            
+            dpg.add_spacing(count=2)
+        
+        # Auto-scroll to bottom
+        if self.config.get("ui", "auto_scroll"):
+            # Scroll to bottom (workaround for DearPyGui)
+            dpg.set_y_scroll("chat_history", -1)
+    
+    def _update_streaming_response(self, partial_response: str):
+        """Update streaming response"""
+        try:
+            if hasattr(self, 'current_stream_tag') and dpg.does_item_exist(self.current_stream_tag):
+                dpg.set_value(self.current_stream_tag, partial_response)
+                # Auto-scroll during streaming
+                if self.config.get("ui", "auto_scroll"):
+                    dpg.set_y_scroll("chat_history", -1)
+                logger.debug(f"Updated stream with {len(partial_response)} chars")
+            else:
+                logger.error(f"Stream tag {getattr(self, 'current_stream_tag', 'None')} doesn't exist!")
+        except Exception as e:
+            logger.error(f"Error updating stream: {e}", exc_info=True)
+    
+    def _finalize_streaming_response(self, final_response: str):
+        """Finalize streaming response"""
+        if hasattr(self, 'current_stream_tag') and dpg.does_item_exist(self.current_stream_tag):
+            dpg.set_value(self.current_stream_tag, final_response)
+        
+        # Reset streaming state
+        self.streaming_group_id = None
+        if hasattr(self, 'current_stream_tag'):
+            delattr(self, 'current_stream_tag')
+    
+    def _load_model_dialog(self):
+        """Show model loading dialog"""
+        models = self.model_manager.get_available_models()
+        
+        if not models:
+            self._show_info_popup("No Models Found", 
+                                "No GGUF models found in the models directory.\n"
+                                "Please add model files to the 'models' folder.")
+            return
+        
+        # Create model selection popup
+        with dpg.window(label="Select Model", modal=True, tag="model_dialog", 
+                       width=500, height=300, pos=[350, 200]):
+            
+            dpg.add_text("Available Models:")
+            
+            model_names = [f"{m['name']} ({m['size_gb']:.1f}GB)" for m in models]
+            dpg.add_listbox(
+                model_names,
+                tag="model_listbox",
+                num_items=min(len(models), 8),
+                width=-1
+            )
+            
+            dpg.add_spacing(count=2)
+            
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="Load Selected",
+                    callback=self._load_selected_model,
+                    width=120
+                )
+                dpg.add_button(
+                    label="Cancel",
+                    callback=lambda: dpg.delete_item("model_dialog"),
+                    width=80
+                )
+    
+    def _load_selected_model(self):
+        """Load the selected model"""
+        selection = dpg.get_value("model_listbox")
+        if not selection:
+            return
+        
+        # Get model path - fix the model selection bug
+        models = self.model_manager.get_available_models()
+        model_names = [f"{m['name']} ({m['size_gb']:.1f}GB)" for m in models]
+        
+        try:
+            selected_index = model_names.index(selection)
+            selected_model = models[selected_index]
+        except (ValueError, IndexError):
+            logger.error(f"Invalid model selection: {selection}")
+            return
+        
+        # Close dialog
+        dpg.delete_item("model_dialog")
+        
+        # Show progress
+        dpg.configure_item("model_load_progress", show=True)
+        dpg.set_value("model_status", "Loading...")
+        
+        def load_model():
+            def progress_callback(progress):
+                dpg.set_value("model_load_progress", progress)
+            
+            # Run async loading
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                success = loop.run_until_complete(
+                    self.model_manager.load_model(
+                        selected_model["path"],
+                        progress_callback
+                    )
+                )
+            finally:
+                loop.close()
+            
+            if success:
+                dpg.set_value("model_status", f"Loaded: {selected_model['name']}")
+                dpg.configure_item("model_status", color=self.theme["success"])
+                self._update_model_info()
+            else:
+                dpg.set_value("model_status", "Load failed")
+                dpg.configure_item("model_status", color=self.theme["error"])
+            
+            dpg.configure_item("model_load_progress", show=False)
+        
+        threading.Thread(target=load_model, daemon=True).start()
+    
+    def _execute_plugin(self, plugin_name: str):
+        """Execute a plugin"""
+        print(f"_execute_plugin called with: '{plugin_name}'")
+        user_input = dpg.get_value("user_input")
+        
+        # Special handling for web research - prompt for search terms if no input
+        if plugin_name == "web_research" and not user_input.strip():
+            print("Triggering web search prompt")
+            self._prompt_web_search()
+            return
+        
+        if not user_input.strip():
+            print("No input - showing popup")
+            self._show_info_popup("No Input", "Please enter some text to process.")
+            return
+        
+        def run_plugin():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                result = loop.run_until_complete(
+                    self.plugin_manager.execute_plugin(plugin_name, user_input)
+                )
+            finally:
+                loop.close()
+                
+                if result:
+                    # Add plugin result to chat
+                    self._add_chat_message(f"Plugin ({plugin_name})", result, self.theme["accent"])
+                
+            except Exception as e:
+                logger.error(f"Plugin execution error: {e}")
+                self._add_chat_message("Plugin Error", str(e), self.theme["error"])
+        
+        threading.Thread(target=run_plugin, daemon=True).start()
+    
+    def _apply_template(self):
+        """Apply template to input"""
+        template = dpg.get_value("template_combo")
+        current_text = dpg.get_value("user_input")
+        
+        templates = {
+            "Summarize": f"Please provide a concise summary of the following:\n\n{current_text}",
+            "Explain": f"Please explain this in simple terms:\n\n{current_text}",
+            "Fix Grammar": f"Please fix the grammar and improve clarity:\n\n{current_text}",
+            "Translate": f"Please translate this to English:\n\n{current_text}"
+        }
+        
+        if template in templates:
+            dpg.set_value("user_input", templates[template])
+    
+    def _clear_chat(self):
+        """Clear chat history"""
+        dpg.delete_item("chat_history", children_only=True)
+        dpg.add_text("Chat cleared.", parent="chat_history", color=self.theme["text_secondary"])
+    
+    def _new_session(self):
+        """Start new session"""
+        self.chat_engine.start_new_session()
+        self._clear_chat()
+        dpg.add_text("New session started.", parent="chat_history", color=self.theme["accent"])
+    
+    def _export_conversation(self):
+        """Export conversation to file"""
+        def export_task():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                history = loop.run_until_complete(
+                    self.chat_engine.get_conversation_context(limit=100)
+                )
+            finally:
+                loop.close()
+                
+                if history:
+                    filename = f"conversation_{int(time.time())}.txt"
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.write("AI Runner Pro - Conversation Export\n")
+                        f.write("=" * 50 + "\n\n")
+                        
+                        for turn in reversed(history):
+                            f.write(f"User: {turn['user_message']}\n")
+                            f.write(f"Assistant: {turn['ai_response']}\n")
+                            f.write(f"Time: {turn['timestamp']}\n")
+                            f.write("-" * 30 + "\n\n")
+                    
+                    self._show_info_popup("Export Complete", f"Conversation saved to {filename}")
+                else:
+                    self._show_info_popup("No History", "No conversation history to export.")
+                    
+            except Exception as e:
+                logger.error(f"Export error: {e}")
+                self._show_info_popup("Export Error", str(e))
+        
+        threading.Thread(target=export_task, daemon=True).start()
+    
+    def _show_memory_stats(self):
+        """Show memory statistics"""
+        def get_stats():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                stats = self.memory_manager.get_stats()
+            finally:
+                loop.close()
+                
+                stats_text = f"""Memory Statistics:
+                
+Total conversations: {stats['total_conversations']}
+Cached conversations: {stats['cached_conversations']}
+Vector index size: {stats['vector_index_size']}
+Embedding available: {stats['embedding_available']}
+Similarity threshold: {stats['similarity_threshold']:.2f}"""
+                
+                self._show_info_popup("Memory Statistics", stats_text)
+                
+            except Exception as e:
+                logger.error(f"Stats error: {e}")
+                self._show_info_popup("Stats Error", str(e))
+        
+        threading.Thread(target=get_stats, daemon=True).start()
+    
+    def _clear_memory_dialog(self):
+        """Show clear memory confirmation"""
+        with dpg.window(label="Clear Memory", modal=True, tag="clear_memory_dialog",
+                       width=400, height=200, pos=[400, 300]):
+            
+            dpg.add_text("Are you sure you want to clear conversation memory?")
+            dpg.add_text("This action cannot be undone.", color=self.theme["warning"])
+            
+            dpg.add_spacing(count=2)
+            
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="Clear Memory",
+                    callback=self._confirm_clear_memory,
+                    width=120
+                )
+                dpg.add_button(
+                    label="Cancel",
+                    callback=lambda: dpg.delete_item("clear_memory_dialog"),
+                    width=80
+                )
+    
+    def _confirm_clear_memory(self):
+        """Confirm memory clearing"""
+        dpg.delete_item("clear_memory_dialog")
+        
+        def clear_task():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                loop.run_until_complete(self.memory_manager.clear_history(keep_recent=5))
+            finally:
+                loop.close()
+                self._show_info_popup("Memory Cleared", "Conversation memory has been cleared.")
+                
+            except Exception as e:
+                logger.error(f"Clear memory error: {e}")
+                self._show_info_popup("Clear Error", str(e))
+        
+        threading.Thread(target=clear_task, daemon=True).start()
+    
+    def _prompt_web_search(self):
+        """Prompt user for web search terms"""
+        with dpg.window(label="Web Search", modal=True, tag="web_search_dialog",
+                       width=400, height=200, pos=[400, 300]):
+            
+            dpg.add_text("Enter search terms:")
+            dpg.add_input_text(
+                tag="search_input",
+                width=-1,
+                hint="e.g. artificial intelligence"
+            )
+            
+            dpg.add_spacing(count=2)
+            
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="Search",
+                    callback=self._execute_web_search,
+                    width=80
+                )
+                dpg.add_button(
+                    label="Cancel",
+                    callback=lambda: dpg.delete_item("web_search_dialog"),
+                    width=80
+                )
+    
+    def _execute_web_search(self):
+        """Execute web search with dialog input"""
+        search_terms = dpg.get_value("search_input").strip()
+        dpg.delete_item("web_search_dialog")
+        
+        if not search_terms:
+            return
+        
+        def run_plugin():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                result = loop.run_until_complete(
+                    self.plugin_manager.execute_plugin("web_research", search_terms)
+                )
+            finally:
+                loop.close()
+                
+                if result:
+                    self._add_chat_message(f"Web Research: {search_terms}", result, self.theme["accent"])
+                
+            except Exception as e:
+                logger.error(f"Web research error: {e}")
+                self._add_chat_message("Web Research Error", str(e), self.theme["error"])
+        
+        threading.Thread(target=run_plugin, daemon=True).start()
+    
+    def _show_info_popup(self, title: str, message: str):
+        """Show information popup"""
+        with dpg.window(label=title, modal=True, tag=f"info_popup_{int(time.time())}",
+                       width=400, height=200, pos=[400, 300]):
+            
+            dpg.add_text(message, wrap=350)
+            
+            dpg.add_spacing(count=2)
+            
+            dpg.add_button(
+                label="OK",
+                callback=lambda s, a, u, tag=f"info_popup_{int(time.time())}": dpg.delete_item(tag),
+                width=80
+            )
+    
+    def _update_temperature(self, sender, value):
+        """Update temperature setting"""
+        self.config.set("model", "temperature", value)
+    
+    def _update_max_tokens(self, sender, value):
+        """Update max tokens setting"""
+        self.config.set("model", "max_tokens", value)
+    
+    def _update_timeout(self, sender, value):
+        """Update timeout setting"""
+        self.config.set("model", "timeout_seconds", value)
+    
+    def _update_font_size(self, sender, value):
+        """Update font size setting"""
+        self.config.set("ui", "font_size", value)
+    
+    def _update_input_height(self, sender, value):
+        """Update input height setting"""
+        self.config.set("ui", "input_height", value)
+        dpg.configure_item("user_input", height=value)
+    
+    def _update_scroll_speed(self, sender, value):
+        """Update scroll speed setting"""
+        self.config.set("ui", "auto_scroll_speed", value)
+    
+    def _update_timestamp_format(self, sender, value):
+        """Update timestamp format setting"""
+        self.config.set("ui", "timestamp_format", value)
+    
+    def _update_search_results(self, sender, value):
+        """Update search results count setting"""
+        self.config.set("memory", "search_result_count", value)
+    
+    def _update_cleanup_days(self, sender, value):
+        """Update auto-cleanup days setting"""
+        self.config.set("memory", "auto_cleanup_days", value)
+    
+    def _update_model_info(self):
+        """Update model information display"""
+        info = self.model_manager.get_model_info()
+        if info.get("status") == "loaded":
+            info_text = f"""Model: {info['name']}
+Size: {info['size_gb']:.1f} GB
+Context: {info['settings']['n_ctx']} tokens
+GPU Layers: {info['settings']['n_gpu_layers']}
+Threads: {info['settings']['n_threads']}"""
+            dpg.set_value("model_info", info_text)
+    
+    def _update_system_info(self):
+        """Update system information"""
+        sys_info = self.model_manager.system_info
+        info_text = f"""RAM: {sys_info['ram_gb']:.1f} GB
+CPU Cores: {sys_info['cpu_cores']}
+GPU: {'Available' if sys_info['gpu_available'] else 'Not available'}
+LLM Support: {'Yes' if sys_info['llama_available'] else 'No'}"""
+        dpg.set_value("system_info", info_text)
+# Source package
+"""Text Formatter Plugin"""
+from src.plugin_manager import PluginBase
+import re
+
+class FormatterPlugin(PluginBase):
+    def __init__(self):
+        super().__init__("formatter")
+        self.description = "Clean and format text"
+    
+    async def execute(self, text: str, context=None) -> str:
+        if not text.strip():
+            return "No text provided for formatting."
+        
+        # Remove trailing whitespace
+        lines = [line.rstrip() for line in text.splitlines()]
+        
+        # Remove excessive blank lines (more than 2 consecutive)
+        formatted_lines = []
+        blank_count = 0
+        
+        for line in lines:
+            if line.strip() == "":
+                blank_count += 1
+                if blank_count <= 2:
+                    formatted_lines.append(line)
+            else:
+                blank_count = 0
+                formatted_lines.append(line)
+        
+        # Join and return
+        formatted_text = "\n".join(formatted_lines)
+        
+        return formatted_text
+
+def create_plugin():
+    return FormatterPlugin()
+"""
+Language Enhancement Plugin - AI-powered text analysis and improvement
+Uses local embedding models for semantic understanding and enhancement
+"""
+
+import json
+import logging
+import sqlite3
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+from collections import defaultdict
+import math
+
+# Check dependencies

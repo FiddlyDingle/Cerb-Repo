@@ -1,0 +1,703 @@
+try:
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    DEPS_AVAILABLE = True
+except ImportError as e:
+    DEPS_AVAILABLE = False
+    import_error = str(e)
+
+# PluginBase will be injected by the plugin manager
+
+logger = logging.getLogger(__name__)
+
+class LanguageEnhancerPlugin(PluginBase):
+    def __init__(self):
+        super().__init__("language_enhancer")
+        self.description = "AI-powered language enhancement and semantic analysis"
+        
+        if not DEPS_AVAILABLE:
+            self.enabled = False
+            logger.error(f"Language enhancer disabled - missing dependencies: {import_error}")
+            print(f"LanguageEnhancer: DISABLED - {import_error}")
+            return
+        
+        print("LanguageEnhancer: Initializing...")
+        self.model = None
+        self.db_path = "data/language_knowledge.db"
+        self._init_database()
+        self._load_model()
+        
+    def _load_model(self):
+        """Load lightweight sentence transformer"""
+        try:
+            # Use smallest available model for speed
+            self.model = SentenceTransformer("all-MiniLM-L6-v2")  # Only 22MB
+            print("LanguageEnhancer: Model loaded successfully")
+            logger.info("Language enhancement model loaded")
+        except Exception as e:
+            self.enabled = False
+            logger.error(f"Failed to load model: {e}")
+            print(f"LanguageEnhancer: Model load failed - {e}")
+    
+    def _init_database(self):
+        """Initialize semantic knowledge database"""
+        Path("data").mkdir(exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        
+        # Concepts table
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS concepts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                concept TEXT UNIQUE,
+                definition TEXT,
+                embedding BLOB,
+                usage_count INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Relationships table
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS relationships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                concept_a TEXT,
+                concept_b TEXT,
+                relationship_type TEXT,
+                strength REAL DEFAULT 1.0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Enhancement history
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS enhancements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                original_text TEXT,
+                enhanced_text TEXT,
+                enhancement_type TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    async def execute(self, text: str, context: Dict[str, Any] = None) -> str:
+        """Enhanced language analysis and improvement"""
+        print(f"LanguageEnhancer execute called with text: '{text[:50]}...'")
+        logger.debug(f"LanguageEnhancer execute called with text: '{text[:50]}...'")
+        
+        if not DEPS_AVAILABLE or not self.model:
+            return "Language enhancer not available - missing dependencies"
+        
+        if not text.strip():
+            return "Provide text for language enhancement."
+        
+        # Multi-step enhancement
+        results = []
+        
+        # 1. Semantic Analysis
+        semantic = self._analyze_semantics(text)
+        if semantic:
+            results.append(f"🧠 **Semantic Analysis**:\n{semantic}")
+        
+        # 2. Concept Extraction
+        concepts = self._extract_concepts(text)
+        if concepts:
+            results.append(f"💡 **Key Concepts**: {', '.join(concepts)}")
+        
+        # 3. Enhancement Suggestions
+        suggestions = self._suggest_enhancements(text)
+        if suggestions:
+            results.append(f"✨ **Enhancement Suggestions**:\n{suggestions}")
+        
+        # 4. Related Knowledge
+        related = self._find_related_knowledge(text)
+        if related:
+            results.append(f"🔗 **Related Knowledge**:\n{related}")
+        
+        # 5. Readability Score
+        readability = self._calculate_readability(text)
+        results.append(f"📊 **Readability**: {readability}")
+        
+        # Store analysis
+        self._store_analysis(text, "\n\n".join(results))
+        
+        return f"**Language Enhancement Analysis**\n\n{chr(10).join(results)}"
+    
+    def _analyze_semantics(self, text: str) -> str:
+        """Analyze semantic content using embeddings"""
+        try:
+            sentences = [s.strip() for s in text.split('.') if s.strip()]
+            if len(sentences) < 2:
+                return "Text too short for semantic analysis"
+            
+            # Get embeddings for sentences
+            embeddings = self.model.encode(sentences)
+            
+            # Calculate semantic coherence
+            similarities = []
+            for i in range(len(embeddings) - 1):
+                sim = np.dot(embeddings[i], embeddings[i + 1])
+                similarities.append(sim)
+            
+            avg_coherence = np.mean(similarities)
+            
+            # Determine dominant themes
+            all_embedding = self.model.encode([text])[0]
+            
+            return f"Coherence: {avg_coherence:.2f}/1.0\nSentences: {len(sentences)}\nSemantic density: {'High' if avg_coherence > 0.7 else 'Medium' if avg_coherence > 0.5 else 'Low'}"
+            
+        except Exception as e:
+            logger.error(f"Semantic analysis failed: {e}")
+            return "Semantic analysis unavailable"
+    
+    def _extract_concepts(self, text: str) -> List[str]:
+        """Extract key concepts from text"""
+        try:
+            # Simple concept extraction using patterns
+            concepts = []
+            
+            # Look for proper nouns, technical terms, etc.
+            words = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
+            concepts.extend(words[:5])  # Top 5 proper nouns
+            
+            # Look for repeated important words
+            word_freq = defaultdict(int)
+            for word in re.findall(r'\b[a-z]{4,}\b', text.lower()):
+                if word not in ['that', 'this', 'with', 'from', 'they', 'have', 'will', 'been', 'were']:
+                    word_freq[word] += 1
+            
+            # Add high-frequency meaningful words
+            frequent = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:3]
+            concepts.extend([word for word, freq in frequent if freq > 1])
+            
+            # Store concepts in database
+            for concept in concepts:
+                self._store_concept(concept, text)
+            
+            return list(set(concepts))  # Remove duplicates
+            
+        except Exception as e:
+            logger.error(f"Concept extraction failed: {e}")
+            return []
+    
+    def _suggest_enhancements(self, text: str) -> str:
+        """Suggest improvements to text"""
+        suggestions = []
+        
+        # Length analysis
+        if len(text.split()) > 50:
+            suggestions.append("Consider breaking into shorter paragraphs")
+        
+        # Sentence variety
+        sentences = [s.strip() for s in text.split('.') if s.strip()]
+        lengths = [len(s.split()) for s in sentences]
+        if len(set(lengths)) < 3 and len(sentences) > 3:
+            suggestions.append("Add sentence length variety")
+        
+        # Passive voice detection
+        passive_indicators = ['was', 'were', 'been', 'being']
+        if any(word in text.lower().split() for word in passive_indicators):
+            suggestions.append("Consider reducing passive voice")
+        
+        # Repetition check
+        words = text.lower().split()
+        word_freq = {word: words.count(word) for word in set(words)}
+        repeated = [word for word, count in word_freq.items() if count > 3 and len(word) > 4]
+        if repeated:
+            suggestions.append(f"Words used frequently: {', '.join(repeated[:3])}")
+        
+        return '\n• '.join([''] + suggestions) if suggestions else "Text looks good!"
+    
+    def _find_related_knowledge(self, text: str) -> str:
+        """Find related concepts from knowledge base"""
+        try:
+            # Get text embedding
+            text_embedding = self.model.encode([text])[0]
+            
+            # Query database for similar concepts
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.execute("SELECT concept, definition, embedding FROM concepts LIMIT 50")
+            
+            similarities = []
+            for row in cursor:
+                concept, definition, embedding_blob = row
+                if embedding_blob:
+                    stored_embedding = np.frombuffer(embedding_blob, dtype=np.float32)
+                    similarity = np.dot(text_embedding, stored_embedding)
+                    if similarity > 0.6:  # Threshold for relevance
+                        similarities.append((concept, definition, similarity))
+            
+            conn.close()
+            
+            # Sort by similarity and return top matches
+            similarities.sort(key=lambda x: x[2], reverse=True)
+            
+            if similarities:
+                related = [f"{concept}: {definition[:100]}..." for concept, definition, _ in similarities[:3]]
+                return '\n• '.join([''] + related)
+            else:
+                return "No related knowledge found - this appears to be new content"
+                
+        except Exception as e:
+            logger.error(f"Related knowledge search failed: {e}")
+            return "Related knowledge search unavailable"
+    
+    def _calculate_readability(self, text: str) -> str:
+        """Simple readability assessment"""
+        sentences = len([s for s in text.split('.') if s.strip()])
+        words = len(text.split())
+        syllables = sum([self._count_syllables(word) for word in text.split()])
+        
+        if sentences == 0:
+            return "Unable to calculate"
+        
+        # Simplified Flesch reading ease
+        avg_sentence_length = words / sentences
+        avg_syllables_per_word = syllables / words if words > 0 else 0
+        
+        # Readability categories
+        if avg_sentence_length < 15 and avg_syllables_per_word < 1.5:
+            level = "Easy"
+        elif avg_sentence_length < 20 and avg_syllables_per_word < 2.0:
+            level = "Moderate"
+        else:
+            level = "Complex"
+        
+        return f"{level} (avg {avg_sentence_length:.1f} words/sentence, {avg_syllables_per_word:.1f} syllables/word)"
+    
+    def _count_syllables(self, word: str) -> int:
+        """Estimate syllable count"""
+        word = word.lower()
+        vowels = 'aeiouy'
+        syllables = 0
+        prev_was_vowel = False
+        
+        for char in word:
+            if char in vowels:
+                if not prev_was_vowel:
+                    syllables += 1
+                prev_was_vowel = True
+            else:
+                prev_was_vowel = False
+        
+        if word.endswith('e'):
+            syllables -= 1
+        
+        return max(1, syllables)
+    
+    def _store_concept(self, concept: str, context: str):
+        """Store concept in database"""
+        try:
+            embedding = self.model.encode([concept])[0]
+            embedding_blob = embedding.tobytes()
+            
+            conn = sqlite3.connect(self.db_path)
+            
+            # Update or insert concept
+            conn.execute('''
+                INSERT OR REPLACE INTO concepts (concept, definition, embedding, usage_count)
+                VALUES (?, ?, ?, COALESCE((SELECT usage_count FROM concepts WHERE concept = ?) + 1, 1))
+            ''', (concept, context[:200], embedding_blob, concept))
+            
+            conn.commit()
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"Failed to store concept: {e}")
+    
+    def _store_analysis(self, original: str, analysis: str):
+        """Store analysis in database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute('''
+                INSERT INTO enhancements (original_text, enhanced_text, enhancement_type)
+                VALUES (?, ?, ?)
+            ''', (original[:500], analysis[:1000], "semantic_analysis"))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed to store analysis: {e}")
+
+def create_plugin():
+    return LanguageEnhancerPlugin()
+"""Summary Plugin"""
+from src.plugin_manager import PluginBase
+
+class SummaryPlugin(PluginBase):
+    def __init__(self):
+        super().__init__("summarizer")
+        self.description = "Summarize text using AI"
+    
+    async def execute(self, text: str, context=None) -> str:
+        if not text.strip():
+            return "No text provided for summarization."
+        
+        # This would integrate with the chat engine for AI summarization
+        # For now, provide a simple summary
+        sentences = text.split(". ")
+        if len(sentences) <= 3:
+            return "Text is already quite short."
+        
+        # Simple extractive summary (first and last sentences)
+        summary = sentences[0] + ". " + sentences[-1]
+        
+        return f"""Quick Summary:
+{summary}
+
+Original length: {len(text)} characters
+Summary length: {len(summary)} characters
+Compression: {((len(text) - len(summary)) / len(text) * 100):.1f}%"""
+
+def create_plugin():
+    return SummaryPlugin()
+"""
+Web Research Plugin - Fixed for AI Runner Pro
+"""
+
+import json
+import logging
+import re
+import sqlite3
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+
+# Get logger without reconfiguring
+logger = logging.getLogger(__name__)
+
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    DEPS_AVAILABLE = True
+except ImportError:
+    DEPS_AVAILABLE = False
+
+# PluginBase will be injected by the plugin manager
+
+logger = logging.getLogger(__name__)
+
+class WebResearchPlugin(PluginBase):
+    def __init__(self):
+        super().__init__("web_research")
+        self.description = "Web research with persistent storage. Commands: [topic], 'recall [topic]', 'list'"
+        logger.debug(f"WebResearchPlugin initializing...")
+        
+        if not DEPS_AVAILABLE:
+            print("WebResearch: Dependencies not available - disabling plugin")
+            logger.error("Dependencies not available - disabling plugin")
+            self.enabled = False
+            return
+        
+        print("WebResearch: All dependencies available - plugin enabled")
+        logger.debug("All dependencies available - plugin enabled")
+            
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        self.db_path = "data/research_knowledge.db"
+        self._init_database()
+    
+    def _init_database(self):
+        """Initialize research database"""
+        Path("data").mkdir(exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS research_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL,
+                title TEXT,
+                content TEXT,
+                url TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    
+    async def execute(self, text: str, context: Dict[str, Any] = None) -> str:
+        """Execute web research from multiple sources"""
+        print(f"WebResearch execute called with text: '{text[:50]}...'")
+        logger.debug(f"WebResearch execute called with text: '{text[:50]}...'")
+        
+        if not DEPS_AVAILABLE:
+            return "Missing dependencies: pip install requests beautifulsoup4"
+            
+        if not text.strip():
+            return "Provide a research topic."
+        
+        topic = text.strip()
+        
+        # Check for special commands
+        if topic.lower().startswith("recall ") or topic.lower().startswith("find "):
+            search_term = topic.split(" ", 1)[1] if " " in topic else ""
+            return self._search_stored_research(search_term)
+        
+        if topic.lower() in ["list", "show all", "history"]:
+            return self._list_recent_research()
+        
+        # Check if we already have recent research on this topic
+        existing = self._check_existing_research(topic)
+        if existing:
+            return f"**Found existing research on '{topic}':**\n\n{existing}\n\n*Use 'recall {topic}' to see full research history.*"
+        
+        # Perform new research
+        results = []
+        
+        # Wikipedia
+        wiki_result = await self._search_wikipedia(topic)
+        if wiki_result:
+            results.append(f"📖 **Wikipedia**: {wiki_result}")
+        
+        # DuckDuckGo Instant Answer
+        ddg_result = await self._search_duckduckgo(topic)
+        if ddg_result:
+            results.append(f"🔍 **DuckDuckGo**: {ddg_result}")
+        
+        # Simple web search
+        web_result = await self._search_web(topic)
+        if web_result:
+            results.append(f"🌐 **Web**: {web_result}")
+        
+        if not results:
+            return f"No results found for: {topic}"
+        
+        # Store consolidated result
+        full_result = "\n\n".join(results)
+        self._store_research(topic, f"Multi-source research: {topic}", full_result, "multiple")
+        
+        return f"**Research: {topic}**\n\n{full_result}\n\n*💾 Stored in knowledge base. Use 'recall {topic}' to retrieve later.*"
+    
+    async def _search_wikipedia(self, topic: str) -> Optional[str]:
+        """Search Wikipedia"""
+        try:
+            wiki_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{topic.replace(' ', '_')}"
+            response = self.session.get(wiki_url, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if 'extract' in data:
+                    return f"{data['title']}\n{data['extract'][:300]}..."
+        except:
+            pass
+        return None
+    
+    async def _search_duckduckgo(self, topic: str) -> Optional[str]:
+        """Search DuckDuckGo instant answers"""
+        try:
+            ddg_url = f"https://api.duckduckgo.com/?q={topic}&format=json&no_html=1&skip_disambig=1"
+            response = self.session.get(ddg_url, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Try abstract first
+                if data.get('Abstract'):
+                    return f"{data.get('AbstractSource', 'Unknown')}\n{data['Abstract'][:300]}..."
+                
+                # Try definition
+                if data.get('Definition'):
+                    return f"{data.get('DefinitionSource', 'Dictionary')}\n{data['Definition'][:300]}..."
+                
+                # Try answer
+                if data.get('Answer'):
+                    return f"Quick Answer\n{data['Answer'][:300]}"
+                    
+        except:
+            pass
+        return None
+    
+    async def _search_web(self, topic: str) -> Optional[str]:
+        """Simple web search via search engine"""
+        try:
+            # Use a simple search that doesn't require API keys
+            search_url = f"https://html.duckduckgo.com/html/?q={topic.replace(' ', '+')}"
+            response = self.session.get(search_url, timeout=15)
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Find first result
+                result = soup.find('a', {'class': 'result__a'})
+                if result:
+                    title = result.get_text()[:100]
+                    
+                    # Try to get snippet
+                    snippet_elem = result.find_parent().find_next('a', {'class': 'result__snippet'})
+                    snippet = snippet_elem.get_text()[:200] if snippet_elem else "No description available"
+                    
+                    return f"{title}\n{snippet}..."
+                    
+        except:
+            pass
+        return None
+    
+    def _store_research(self, topic: str, title: str, content: str, url: str):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute('''
+                INSERT INTO research_entries (topic, title, content, url)
+                VALUES (?, ?, ?, ?)
+            ''', (topic, title, content, url))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Storage failed: {e}")
+    
+    def _check_existing_research(self, topic: str) -> Optional[str]:
+        """Check if we have recent research on this topic"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.execute('''
+                SELECT content, created_at FROM research_entries 
+                WHERE LOWER(topic) LIKE LOWER(?)
+                ORDER BY created_at DESC 
+                LIMIT 1
+            ''', (f"%{topic}%",))
+            
+            row = cursor.fetchone()
+            conn.close()
+            
+            if row:
+                content, created_at = row
+                return f"{content[:500]}..."
+            
+        except Exception as e:
+            logger.error(f"Research check failed: {e}")
+        
+        return None
+    
+    def _search_stored_research(self, search_term: str) -> str:
+        """Search through stored research"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.execute('''
+                SELECT topic, title, content, created_at FROM research_entries 
+                WHERE LOWER(topic) LIKE LOWER(?) OR LOWER(content) LIKE LOWER(?)
+                ORDER BY created_at DESC 
+                LIMIT 5
+            ''', (f"%{search_term}%", f"%{search_term}%"))
+            
+            results = cursor.fetchall()
+            conn.close()
+            
+            if not results:
+                return f"No stored research found for: {search_term}"
+            
+            output = [f"📚 **Found {len(results)} research entries for '{search_term}':**\n"]
+            
+            for i, (topic, title, content, created_at) in enumerate(results, 1):
+                # Parse the date
+                try:
+                    date_obj = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    date_str = date_obj.strftime("%m/%d %H:%M")
+                except:
+                    date_str = created_at
+                
+                output.append(f"**{i}. {topic}** ({date_str})")
+                output.append(f"{content[:300]}...\n")
+            
+            return "\n".join(output)
+            
+        except Exception as e:
+            logger.error(f"Research search failed: {e}")
+            return f"Error searching research: {e}"
+    
+    def _list_recent_research(self) -> str:
+        """List recent research topics"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.execute('''
+                SELECT topic, created_at FROM research_entries 
+                ORDER BY created_at DESC 
+                LIMIT 10
+            ''')
+            
+            results = cursor.fetchall()
+            conn.close()
+            
+            if not results:
+                return "No research history found."
+            
+            output = ["📋 **Recent Research History:**\n"]
+            
+            for topic, created_at in results:
+                try:
+                    date_obj = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    date_str = date_obj.strftime("%m/%d %H:%M")
+                except:
+                    date_str = created_at
+                
+                output.append(f"• {topic} ({date_str})")
+            
+            output.append("\n*Use 'recall [topic]' to retrieve specific research.*")
+            return "\n".join(output)
+            
+        except Exception as e:
+            logger.error(f"Research list failed: {e}")
+            return f"Error listing research: {e}"
+    
+    def _get_relevant_context(self, query: str) -> Optional[str]:
+        """Get relevant research context for conversational use"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.execute('''
+                SELECT topic, content FROM research_entries 
+                WHERE LOWER(topic) LIKE LOWER(?) OR LOWER(content) LIKE LOWER(?)
+                ORDER BY created_at DESC 
+                LIMIT 3
+            ''', (f"%{query}%", f"%{query}%"))
+            
+            results = cursor.fetchall()
+            conn.close()
+            
+            if not results:
+                return None
+            
+            # Format relevant research for context
+            context_parts = []
+            for topic, content in results:
+                # Extract key info (first 200 chars)
+                summary = content[:200].replace('\n', ' ').strip()
+                context_parts.append(f"Research on {topic}: {summary}...")
+            
+            return "\n".join(context_parts)
+            
+        except Exception as e:
+            logger.error(f"Context retrieval failed: {e}")
+            return None
+
+def create_plugin():
+    return WebResearchPlugin()
+"""Word Counter Plugin"""
+from src.plugin_manager import PluginBase
+
+class WordCounterPlugin(PluginBase):
+    def __init__(self):
+        super().__init__("word_counter")
+        self.description = "Count words, characters, and lines in text"
+    
+    async def execute(self, text: str, context=None) -> str:
+        if not text.strip():
+            return "No text provided for counting."
+        
+        words = len(text.split())
+        chars = len(text)
+        chars_no_spaces = len(text.replace(" ", ""))
+        lines = len(text.splitlines())
+        paragraphs = len([p for p in text.split("\n\n") if p.strip()])
+        
+        return f"""Text Statistics:
+Words: {words:,}
+Characters: {chars:,}
+Characters (no spaces): {chars_no_spaces:,}
+Lines: {lines:,}
+Paragraphs: {paragraphs:,}
+Average words per line: {words/max(lines,1):.1f}"""
+
+def create_plugin():
+    return WordCounterPlugin()
+# Plugins package

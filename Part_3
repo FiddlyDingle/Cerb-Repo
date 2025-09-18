@@ -1,0 +1,705 @@
+            """
+        }
+        
+        return messages.get(error_type, f"Model Error: {details}")
+    
+    @staticmethod
+    def get_memory_error_message(error_type: str, details: str = "") -> str:
+        """Get user-friendly message for memory-related errors"""
+        messages = {
+            "database_locked": """
+❌ Database Access Error
+The conversation database is locked or inaccessible.
+
+🔧 How to fix:
+1. Close other instances of the application
+2. Check if data/ directory is writable
+3. Restart the application
+4. If persistent, delete data/conversations.db to reset
+            """,
+            "embedding_failed": """
+❌ Embedding Model Error
+Failed to load or use the embedding model for memory.
+
+🔧 How to fix:
+1. Check internet connection (for first-time download)
+2. Ensure sufficient disk space
+3. Try deleting models/ and letting it re-download
+4. Disable memory features in config if needed
+            """,
+            "disk_space": f"""
+❌ Insufficient Disk Space
+Not enough space to store conversation data.
+
+🔧 How to fix:
+1. Free up disk space
+2. Move application to drive with more space
+3. Clear old conversation history
+4. Reduce auto_cleanup_days in config
+
+Details: {details}
+            """
+        }
+        
+        return messages.get(error_type, f"Memory Error: {details}")
+    
+    @staticmethod
+    def get_configuration_help() -> str:
+        """Get comprehensive configuration help"""
+        return """
+🔧 Configuration Troubleshooting Guide
+
+Common Issues:
+1. Invalid JSON syntax
+   • Check for missing commas, quotes, or brackets
+   • Use a JSON validator online
+   • Delete config.json to reset to defaults
+
+2. Invalid values
+   • Temperature must be between 0.0 and 2.0
+   • Window dimensions must be reasonable (800x600 minimum)
+   • Memory settings must be positive numbers
+
+3. Missing model directory
+   • Create a 'models/' folder in the application directory
+   • Download GGUF model files and place them there
+
+4. Performance issues
+   • Reduce max_memory_mb if system has limited RAM
+   • Lower thread_count on older systems
+   • Disable preload_model for faster startup
+
+Configuration Sections:
+• model: LLM settings (paths, context, temperature)
+• memory: Conversation storage and search
+• ui: Interface appearance and behavior  
+• performance: System optimization settings
+
+For complete reset: Delete config.json and restart
+        """
+    
+    @staticmethod
+    def get_system_requirements() -> str:
+        """Get system requirements information"""
+        return """
+💻 System Requirements
+
+Minimum Requirements:
+• Python 3.8 or newer
+• 4GB RAM (8GB recommended)
+• 2GB free disk space
+• Windows 10/11, macOS 10.15+, or Linux
+
+For GPU Acceleration:
+• NVIDIA GPU with CUDA support
+• CUDA 11.8 or newer
+• 6GB+ VRAM for larger models
+
+Recommended Setup:
+• 16GB+ RAM for better performance
+• SSD storage for faster model loading
+• Modern CPU (4+ cores)
+
+Package Dependencies:
+• llama-cpp-python (LLM engine)
+• sentence-transformers (embeddings)
+• dearpygui (user interface)
+• faiss-cpu (vector search)
+• numpy, torch (core libraries)
+        """
+
+def format_error_for_user(error: Exception, context: str = "") -> str:
+    """Format any error for user-friendly display"""
+    error_type = type(error).__name__
+    error_msg = str(error)
+    
+    formatted = f"""
+❌ {error_type}
+{error_msg}
+"""
+    
+    if context:
+        formatted += f"\nContext: {context}\n"
+    
+    formatted += """
+🔧 General Troubleshooting:
+1. Check the application logs for detailed information
+2. Ensure all required packages are installed
+3. Verify configuration file is valid
+4. Try restarting the application
+5. Check system requirements and available resources
+
+📝 If the problem persists:
+• Check the logs in data/app.log
+• Review configuration with validation
+• Consider resetting to defaults
+"""
+    
+    return formatted
+
+# Export helper instance
+error_helper = ErrorMessageHelper()
+"""
+Memory Manager - Efficient conversation storage and retrieval
+"""
+
+import asyncio
+import json
+import logging
+import sqlite3
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+
+import numpy as np
+import faiss
+
+logger = logging.getLogger(__name__)
+
+# Embedding support
+try:
+    from sentence_transformers import SentenceTransformer
+    HAS_EMBEDDINGS = True
+except ImportError:
+    HAS_EMBEDDINGS = False
+    logger.warning("sentence-transformers not installed")
+
+class MemoryManager:
+    """Handles conversation memory and semantic search"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.db_path = Path("data/conversations.db")
+        self.db_conn = None
+        
+        # Embedding components
+        self.encoder = None
+        self.faiss_index = None
+        self.memory_cache = deque(maxlen=config.get("memory", "max_conversations"))
+        
+        # Performance settings
+        self.embedding_dim = 384  # all-MiniLM-L6-v2 dimension
+        self.similarity_threshold = config.get("memory", "similarity_threshold")
+        
+    async def initialize(self):
+        """Initialize memory system"""
+        logger.info("Initializing Memory Manager...")
+        
+        # Setup database
+        await self._init_database()
+        
+        # Setup embeddings if available
+        if HAS_EMBEDDINGS:
+            await self._init_embeddings()
+        
+        # Load recent conversations
+        await self._load_recent_conversations()
+        
+        logger.info("Memory Manager initialized")
+    
+    async def _init_database(self):
+        """Initialize SQLite database with proper threading"""
+        # Ensure data directory exists
+        self.db_path.parent.mkdir(exist_ok=True)
+        
+        # Use thread-safe connection
+        def create_connection():
+            return sqlite3.connect(
+                self.db_path, 
+                check_same_thread=False,
+                timeout=30.0
+            )
+        
+        import threading
+        import asyncio
+        loop = asyncio.get_event_loop()
+        self.db_conn = await loop.run_in_executor(None, create_connection)
+        self.db_conn.row_factory = sqlite3.Row
+        
+        # Enable WAL mode for better concurrency
+        self.db_conn.execute("PRAGMA journal_mode=WAL")
+        self.db_conn.execute("PRAGMA synchronous=NORMAL")
+        self.db_conn.execute("PRAGMA cache_size=10000")
+        
+        # Create tables
+        self.db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_message TEXT NOT NULL,
+                ai_response TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                session_id TEXT,
+                embedding BLOB,
+                metadata TEXT
+            )
+        """)
+        
+        self.db_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_timestamp ON conversations(timestamp)
+        """)
+        
+        self.db_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session ON conversations(session_id)
+        """)
+        
+        self.db_conn.commit()
+    
+    async def _init_embeddings(self):
+        """Initialize embedding model and FAISS index"""
+        try:
+            model_name = self.config.get("memory", "embedding_model")
+            
+            # Load or download model
+            models_dir = Path("models")
+            local_path = models_dir / model_name
+            
+            if local_path.exists():
+                self.encoder = SentenceTransformer(str(local_path))
+            else:
+                logger.info(f"Downloading embedding model: {model_name}")
+                self.encoder = SentenceTransformer(model_name)
+                models_dir.mkdir(exist_ok=True)
+                # Encoder saving handled by shared manager)
+            
+            # Initialize FAISS index
+            self.faiss_index = faiss.IndexFlatIP(self.embedding_dim)
+            
+            # Load existing embeddings
+            await self._load_embeddings()
+            
+            logger.info(f"Embeddings initialized: {self.faiss_index.ntotal} vectors")
+            
+        except Exception as e:
+            logger.error(f"Embedding initialization failed: {e}")
+            self.encoder = None
+    
+    async def _load_embeddings(self):
+        """Load existing embeddings into FAISS"""
+        cursor = self.db_conn.execute(
+            "SELECT embedding FROM conversations WHERE embedding IS NOT NULL"
+        )
+        
+        embeddings = []
+        for row in cursor:
+            if row[0]:
+                embedding = np.frombuffer(row[0], dtype=np.float32)
+                embeddings.append(embedding)
+        
+        if embeddings:
+            embeddings_array = np.array(embeddings).astype('float32')
+            faiss.normalize_L2(embeddings_array)
+            self.faiss_index.add(embeddings_array)
+    
+    async def _load_recent_conversations(self):
+        """Load recent conversations into cache"""
+        cursor = self.db_conn.execute("""
+            SELECT user_message, ai_response, timestamp 
+            FROM conversations 
+            ORDER BY timestamp DESC 
+            LIMIT ?
+        """, (self.config.get("memory", "max_conversations"),))
+        
+        for row in cursor:
+            self.memory_cache.appendleft({
+                "user": row[0],
+                "assistant": row[1],
+                "timestamp": row[2]
+            })
+    
+    async def store_conversation(
+        self, 
+        user_message: str, 
+        ai_response: str,
+        session_id: str = "default",
+        metadata: Optional[Dict] = None
+    ) -> int:
+        """Store conversation with optional embedding"""
+        try:
+            # Generate embedding if available
+            embedding_blob = None
+            if self.encoder:
+                conversation_text = f"User: {user_message}\nAssistant: {ai_response}"
+                embedding = self.encoder.encode([conversation_text])[0].astype('float32')
+                embedding_blob = embedding.tobytes()
+                
+                # Add to FAISS
+                faiss.normalize_L2(embedding.reshape(1, -1))
+                self.faiss_index.add(embedding.reshape(1, -1))
+            
+            # Store in database
+            cursor = self.db_conn.execute("""
+                INSERT INTO conversations 
+                (user_message, ai_response, session_id, embedding, metadata)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                user_message,
+                ai_response,
+                session_id,
+                embedding_blob,
+                json.dumps(metadata) if metadata else None
+            ))
+            
+            self.db_conn.commit()
+            conversation_id = cursor.lastrowid
+            
+            # Add to cache
+            self.memory_cache.append({
+                "user": user_message,
+                "assistant": ai_response,
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            return conversation_id
+            
+        except Exception as e:
+            logger.error(f"Store conversation failed: {e}")
+            return -1
+    
+    async def search_similar(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Search for similar conversations"""
+        if not self.encoder or not self.faiss_index or self.faiss_index.ntotal == 0:
+            return []
+        
+        try:
+            # Encode query
+            query_embedding = self.encoder.encode([query])[0].astype('float32')
+            faiss.normalize_L2(query_embedding.reshape(1, -1))
+            
+            # Search FAISS
+            scores, indices = self.faiss_index.search(
+                query_embedding.reshape(1, -1), 
+                min(top_k, self.faiss_index.ntotal)
+            )
+            
+            results = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx == -1 or score < max(self.similarity_threshold, 0.5):
+                    break
+                
+                # Get conversation from database
+                cursor = self.db_conn.execute("""
+                    SELECT user_message, ai_response, timestamp, metadata
+                    FROM conversations 
+                    LIMIT 1 OFFSET ?
+                """, (int(idx),))
+                
+                row = cursor.fetchone()
+                if row:
+                    results.append({
+                        "user_message": row[0],
+                        "ai_response": row[1],
+                        "timestamp": row[2],
+                        "similarity": float(score),
+                        "metadata": json.loads(row[3]) if row[3] else {}
+                    })
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Search failed: {e}")
+            return []
+    
+    def get_recent_conversations(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recent conversations from cache"""
+        return list(self.memory_cache)[-limit:]
+    
+    async def get_conversation_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get conversation history from database"""
+        cursor = self.db_conn.execute("""
+            SELECT user_message, ai_response, timestamp, metadata
+            FROM conversations 
+            ORDER BY timestamp DESC 
+            LIMIT ?
+        """, (limit,))
+        
+        return [{
+            "user_message": row[0],
+            "ai_response": row[1],
+            "timestamp": row[2],
+            "metadata": json.loads(row[3]) if row[3] else {}
+        } for row in cursor]
+    
+    async def clear_history(self, keep_recent: int = 10):
+        """Clear old conversations, keeping recent ones"""
+        cursor = self.db_conn.execute("""
+            DELETE FROM conversations 
+            WHERE id NOT IN (
+                SELECT id FROM conversations 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            )
+        """, (keep_recent,))
+        
+        self.db_conn.commit()
+        
+        # Rebuild FAISS index
+        if self.faiss_index:
+            self.faiss_index.reset()
+            await self._load_embeddings()
+        
+        logger.info(f"Cleared history, kept {keep_recent} recent conversations")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get memory statistics"""
+        cursor = self.db_conn.execute("SELECT COUNT(*) FROM conversations")
+        total_conversations = cursor.fetchone()[0]
+        
+        return {
+            "total_conversations": total_conversations,
+            "cached_conversations": len(self.memory_cache),
+            "vector_index_size": self.faiss_index.ntotal if self.faiss_index else 0,
+            "embedding_available": self.encoder is not None,
+            "similarity_threshold": self.similarity_threshold
+        }
+    
+    async def reset_repetitive_memory(self):
+        """Reset memory that might be causing repetition"""
+        # Keep only last 5 conversations
+        await self.clear_history(keep_recent=5)
+        logger.info("Reset repetitive memory - kept 5 recent conversations")
+    
+    async def shutdown(self):
+        """Clean shutdown"""
+        if self.db_conn:
+            self.db_conn.close()
+        logger.info("Memory Manager shutdown complete")
+"""
+Model Manager - Optimized LLM handling with caching and GPU detection
+"""
+
+import asyncio
+import logging
+import os
+import threading
+import time
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Callable
+import psutil
+
+logger = logging.getLogger(__name__)
+
+# Configure logging with less verbosity
+logging.basicConfig(
+    level=logging.INFO,  # Changed from DEBUG
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',  # Simplified format
+    handlers=[
+        logging.FileHandler('data/app.log', mode='a', encoding='utf-8'),  # Single log file
+        logging.StreamHandler()
+    ]
+)
+try:
+    import torch
+    HAS_GPU = torch.cuda.is_available()
+    if HAS_GPU:
+        GPU_MEMORY = torch.cuda.get_device_properties(0).total_memory // (1024**3)
+        GPU_NAME = torch.cuda.get_device_name(0)
+        print(f"GPU detected: {GPU_NAME} with {GPU_MEMORY}GB VRAM")
+    else:
+        GPU_MEMORY = 0
+        print("No CUDA GPU detected")
+except ImportError:
+    HAS_GPU = False
+    GPU_MEMORY = 0
+    print("PyTorch not installed - GPU unavailable")
+
+# LLM Import
+try:
+    from llama_cpp import Llama
+    HAS_LLAMA = True
+except ImportError:
+    HAS_LLAMA = False
+    logger.warning("llama-cpp-python not installed")
+
+class ModelManager:
+    """Handles LLM loading, caching, and optimization"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.model = None
+        self.model_info = {}
+        self.loading = False
+        self.load_progress = 0.0
+        
+        logger.debug(f"ModelManager init: config keys={list(config.config.keys())}")
+        
+        # Auto-detect optimal settings
+        self.system_info = self._get_system_info()
+        self.optimal_settings = self._calculate_optimal_settings()
+        
+    async def initialize(self):
+        """Initialize model manager"""
+        logger.info("Initializing Model Manager...")
+        
+        # Auto-detect models
+        self.available_models = self._scan_for_models()
+        logger.info(f"Found {len(self.available_models)} models")
+        
+        if self.config.get("performance", "preload_model") and self.available_models:
+            logger.info("Preloading default model...")
+            await self.load_default_model()
+    
+    def _get_system_info(self) -> Dict[str, Any]:
+        """Get system capabilities"""
+        memory_gb = psutil.virtual_memory().total / (1024**3)
+        cpu_cores = psutil.cpu_count()
+        
+        return {
+            "ram_gb": memory_gb,
+            "cpu_cores": cpu_cores,
+            "gpu_available": HAS_GPU,
+            "gpu_memory_gb": GPU_MEMORY,
+            "llama_available": HAS_LLAMA
+        }
+    
+    def _calculate_optimal_settings(self) -> Dict[str, Any]:
+        """Calculate optimal model settings based on system"""
+        ram_gb = self.system_info["ram_gb"]
+        
+        # Conservative settings for reliability
+        settings = {
+            "n_ctx": self.config.get("model", "context_window"),
+            "n_batch": min(512, int(ram_gb * 32)),
+            "n_threads": min(self.system_info["cpu_cores"], 8),
+            "use_mmap": True,
+            "use_mlock": ram_gb > 16,
+            "f16_kv": True,
+            "verbose": False
+        }
+        
+        # GPU layers
+        gpu_config = self.config.get("model", "gpu_layers")
+        if gpu_config == "auto":
+            if HAS_GPU and GPU_MEMORY > 4:
+                settings["n_gpu_layers"] = -1  # Use most layers on GPU
+            else:
+                settings["n_gpu_layers"] = 0
+        else:
+            settings["n_gpu_layers"] = int(gpu_config) if HAS_GPU else 0
+        
+        return settings
+    
+    def _scan_for_models(self) -> List[Dict[str, Any]]:
+        """Scan for available GGUF models"""
+        models = []
+        models_dir = Path(self.config.get("model", "default_path"))
+        
+        if models_dir.exists():
+            for model_file in models_dir.rglob("*.gguf"):
+                size_gb = model_file.stat().st_size / (1024**3)
+                models.append({
+                    "name": model_file.stem,
+                    "path": str(model_file),
+                    "size_gb": round(size_gb, 2)
+                })
+        
+        return sorted(models, key=lambda x: x["size_gb"])
+    
+    async def load_model(self, model_path: str, progress_callback: Optional[Callable] = None) -> bool:
+        """Load model with progress tracking and detailed error reporting"""
+        if self.loading:
+            logger.warning("Model loading already in progress")
+            return False
+        
+        self.loading = True
+        self.load_progress = 0.0
+        
+        try:
+            if not HAS_LLAMA:
+                error_msg = "llama-cpp-python not available. Please install it with: pip install llama-cpp-python"
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+            
+            model_path = Path(model_path)
+            if not model_path.exists():
+                error_msg = f"Model file not found: {model_path}. Please ensure the file exists."
+                logger.error(error_msg)
+                raise FileNotFoundError(error_msg)
+            
+            # Validate model file
+            if not self._validate_model_file(model_path):
+                error_msg = f"Invalid or corrupted model file: {model_path}. Please ensure it's a valid GGUF file."
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            
+            logger.info(f"Loading model: {model_path.name} ({model_path.stat().st_size / (1024**3):.1f}GB)")
+            
+            # Progress simulation (llama-cpp doesn't provide real progress)
+            async def update_progress():
+                for i in range(10):
+                    self.load_progress = (i + 1) * 0.1
+                    if progress_callback:
+                        progress_callback(self.load_progress)
+                    await asyncio.sleep(0.1)
+            
+            # Start progress tracking
+            progress_task = asyncio.create_task(update_progress())
+            
+            # Load model in thread to avoid blocking
+            def load_in_thread():
+                return Llama(
+                    model_path=str(model_path),
+                    **self.optimal_settings
+                )
+            
+            loop = asyncio.get_event_loop()
+            self.model = await loop.run_in_executor(None, load_in_thread)
+            
+            # Complete progress
+            progress_task.cancel()
+            self.load_progress = 1.0
+            if progress_callback:
+                progress_callback(1.0)
+            
+            # Store model info
+            self.model_info = {
+                "path": str(model_path),
+                "name": model_path.stem,
+                "size_gb": model_path.stat().st_size / (1024**3),
+                "settings": self.optimal_settings.copy(),
+                "loaded_at": time.time()
+            }
+            
+            logger.info(f"Model loaded: {model_path.name} ({self.model_info['size_gb']:.1f}GB)")
+            logger.debug(f"Model info stored: {self.model_info}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Model load failed: {e}")
+            logger.debug(f"Exception details:", exc_info=True)
+            return False
+        finally:
+            self.loading = False
+            logger.debug("Model loading flag reset")
+    
+    async def load_default_model(self) -> bool:
+        """Load the first available model"""
+        if not self.available_models:
+            logger.warning("No models found")
+            return False
+        
+        return await self.load_model(self.available_models[0]["path"])
+    
+    async def generate(
+        self, 
+        prompt: str, 
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        stream_callback: Optional[Callable] = None
+    ) -> str:
+        """Generate response with timeout and streaming"""
+        if not self.model:
+            logger.warning("Generate called but no model loaded")
+            return "No model loaded. Please load a model first."
+        
+        # Use config defaults
+        max_tokens = max_tokens or self.config.get("model", "max_tokens")
+        temperature = temperature or self.config.get("model", "temperature")
+        
+        try:
+            def generate_in_thread():
+                params = {
+                    "prompt": prompt,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
